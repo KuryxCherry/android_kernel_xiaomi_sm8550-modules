@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "要同步的目标（lineageos 或指定 KAILUA CLO 驱动子系统）"
+        description: "要同步的目标（batch-kailua 一键追齐全部最新 KAILUA 驱动，或选单项）"
         required: true
-        default: "graphics-kernel"
+        default: "batch-kailua"
         type: choice
         options:
+          - batch-kailua
           - lineageos
           - graphics-kernel
           - display-drivers
@@ -21,14 +22,14 @@ on:
           - dataipa
           - securemsm-kernel
       clo_tag:
-        description: "目标 CLO Tag（选 lineageos 时留空；如 GRAPHICS.LA.1.0.r1-10600-KAILUA.0）"
+        description: "目标 CLO Tag（选 batch-kailua 或 lineageos 时留空）"
         required: false
         default: ""
         type: string
       dry_run:
         description: "仅演练合并检测冲突，不推送"
         required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -53,6 +54,40 @@ jobs:
 
           TARGET="${{ inputs.target }}"
           TAG="${{ inputs.clo_tag }}"
+          MERGED=0
+          CONFLICTS=""
+          RESULTS=""
+
+          merge_one_clo() {
+            local NAME="$1"
+            local REPO="$2"
+            local PREFIX="$3"
+            local WANT_TAG="$4"
+
+            echo "================================================================"
+            echo "[CLO] Syncing ${NAME} -> ${WANT_TAG} (${PREFIX})"
+            echo "================================================================"
+            git fetch --no-tags "${REPO}" "refs/tags/${WANT_TAG}"
+
+            # Check if tag commit is already an ancestor of HEAD
+            if git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
+              echo "[SKIP] ${NAME} already contains ${WANT_TAG}"
+              RESULTS="${RESULTS}\n- SKIP ${NAME} (${WANT_TAG}: already merged)"
+              return 0
+            fi
+
+            if git merge --no-edit -X "subtree=${PREFIX}" FETCH_HEAD -m "Merge tag '${WANT_TAG}' into ${PREFIX}"; then
+              echo "[OK] Merged ${NAME} (${WANT_TAG})"
+              MERGED=$((MERGED + 1))
+              RESULTS="${RESULTS}\n- OK   ${NAME} -> ${WANT_TAG}"
+            else
+              echo "[CONFLICT] ${NAME} (${WANT_TAG}) had conflicts — aborting this subtree safely:"
+              git diff --name-only --diff-filter=U || true
+              git merge --abort
+              CONFLICTS="${CONFLICTS} ${NAME}"
+              RESULTS="${RESULTS}\n- CONFLICT ${NAME} (${WANT_TAG})"
+            fi
+          }
 
           if [ "${TARGET}" = "lineageos" ]; then
             git remote add upstream https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules.git
@@ -60,70 +95,79 @@ jobs:
             BEHIND=$(git rev-list --count HEAD..upstream/lineage-24.0)
             echo "Commits available from LineageOS: ${BEHIND}"
             [ "${BEHIND}" = "0" ] && exit 0
-            if ! git merge --no-edit --no-ff upstream/lineage-24.0; then
-              echo "=== CONFLICTS DETECTED (aborted safely) ==="
-              git diff --name-only --diff-filter=U
+            if git merge --no-edit --no-ff upstream/lineage-24.0; then
+              MERGED=1
+            else
+              git diff --name-only --diff-filter=U || true
               git merge --abort
               exit 1
+            fi
+          elif [ "${TARGET}" = "batch-kailua" ]; then
+            # 1. Standalone subsystem drivers (latest KAILUA Android LA tags)
+            merge_one_clo "graphics-kernel" "https://git.codelinaro.org/clo/la/platform/vendor/qcom/opensource/graphics-kernel.git" "qcom/opensource/graphics-kernel" "GRAPHICS.LA.1.0.r1-10600-KAILUA.0"
+            merge_one_clo "display-drivers" "https://git.codelinaro.org/clo/la/platform/vendor/opensource/display-drivers.git" "qcom/opensource/display-drivers" "DISPLAY.LA.3.0.r1-14200-KAILUA.0"
+            merge_one_clo "camera-kernel"   "https://git.codelinaro.org/clo/la/platform/vendor/opensource/camera-kernel.git"   "qcom/opensource/camera-kernel"   "CAMERA.LA.3.0.r1-11600-KAILUA.0"
+            merge_one_clo "video-driver"    "https://git.codelinaro.org/clo/la/platform/vendor/opensource/video-driver.git"    "qcom/opensource/video-driver"    "VIDEO.LA.3.0.r1-10700-KAILUA.0"
+            merge_one_clo "eva-kernel"      "https://git.codelinaro.org/clo/la/platform/vendor/opensource/eva-kernel.git"      "qcom/opensource/eva-kernel"      "CV.LA.1.0.r1-06500-KAILUA.0"
+            merge_one_clo "dataipa"         "https://git.codelinaro.org/clo/la/platform/vendor/opensource/dataipa.git"         "qcom/opensource/dataipa"         "LA.VENDOR.13.2.0.r1-28400-KAILUA.QSSI16.0"
+            merge_one_clo "securemsm-kernel" "https://git.codelinaro.org/clo/la/platform/vendor/qcom/opensource/securemsm-kernel.git" "qcom/opensource/securemsm-kernel" "LA.VENDOR.13.2.0.r1-28400-KAILUA.QSSI16.0"
+
+            # 2. WLAN trio MUST stay version-locked together (qcacld-3.0 + qca-wifi-host-cmn + fw-api)
+            WLAN_TAG="LA.VENDOR.13.2.0.r1-28400-KAILUA.QSSI16.0"
+            BEFORE_WLAN=$(git rev-parse HEAD)
+            WLAN_OK=1
+            for PAIR in \
+              "wlan-fw-api|https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api.git|qcom/opensource/wlan/fw-api" \
+              "wlan-cmn|https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn.git|qcom/opensource/wlan/qca-wifi-host-cmn" \
+              "wlan-qcacld-3.0|https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0.git|qcom/opensource/wlan/qcacld-3.0"; do
+              W_NAME="${PAIR%%|*}"
+              REST="${PAIR#*|}"
+              W_REPO="${REST%%|*}"
+              W_PREFIX="${REST#*|}"
+              git fetch --no-tags "${W_REPO}" "refs/tags/${WLAN_TAG}"
+              if git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
+                RESULTS="${RESULTS}\n- SKIP ${W_NAME} (${WLAN_TAG}: already merged)"
+              elif git merge --no-edit -X "subtree=${W_PREFIX}" FETCH_HEAD -m "Merge tag '${WLAN_TAG}' into ${W_PREFIX}"; then
+                RESULTS="${RESULTS}\n- OK   ${W_NAME} -> ${WLAN_TAG}"
+              else
+                echo "[CONFLICT] WLAN trio conflict in ${W_NAME}; rolling back entire WLAN trio to keep ABI matched!"
+                git diff --name-only --diff-filter=U || true
+                git merge --abort
+                git reset --hard "${BEFORE_WLAN}"
+                WLAN_OK=0
+                CONFLICTS="${CONFLICTS} wlan-trio(${W_NAME})"
+                RESULTS="${RESULTS}\n- CONFLICT wlan-trio (failed at ${W_NAME}; rolled back trio cleanly)"
+                break
+              fi
+            done
+            if [ "${WLAN_OK}" = "1" ] && [ "$(git rev-parse HEAD)" != "${BEFORE_WLAN}" ]; then
+              MERGED=$((MERGED + 1))
             fi
           else
             [ -n "${TAG}" ] || { echo "ERROR: clo_tag is required for target ${TARGET}"; exit 1; }
             case "${TARGET}" in
-              graphics-kernel)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/qcom/opensource/graphics-kernel.git"
-                PREFIX="qcom/opensource/graphics-kernel"
-                ;;
-              display-drivers)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/opensource/display-drivers.git"
-                PREFIX="qcom/opensource/display-drivers"
-                ;;
-              camera-kernel)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/opensource/camera-kernel.git"
-                PREFIX="qcom/opensource/camera-kernel"
-                ;;
-              video-driver)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/opensource/video-driver.git"
-                PREFIX="qcom/opensource/video-driver"
-                ;;
-              eva-kernel)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/opensource/eva-kernel.git"
-                PREFIX="qcom/opensource/eva-kernel"
-                ;;
-              wlan-qcacld-3.0)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0.git"
-                PREFIX="qcom/opensource/wlan/qcacld-3.0"
-                ;;
-              wlan-cmn)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn.git"
-                PREFIX="qcom/opensource/wlan/qca-wifi-host-cmn"
-                ;;
-              wlan-fw-api)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api.git"
-                PREFIX="qcom/opensource/wlan/fw-api"
-                ;;
-              dataipa)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/opensource/dataipa.git"
-                PREFIX="qcom/opensource/dataipa"
-                ;;
-              securemsm-kernel)
-                REPO="https://git.codelinaro.org/clo/la/platform/vendor/qcom/opensource/securemsm-kernel.git"
-                PREFIX="qcom/opensource/securemsm-kernel"
-                ;;
+              graphics-kernel)  merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/qcom/opensource/graphics-kernel.git" "qcom/opensource/graphics-kernel" "${TAG}" ;;
+              display-drivers)  merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/opensource/display-drivers.git" "qcom/opensource/display-drivers" "${TAG}" ;;
+              camera-kernel)    merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/opensource/camera-kernel.git" "qcom/opensource/camera-kernel" "${TAG}" ;;
+              video-driver)     merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/opensource/video-driver.git" "qcom/opensource/video-driver" "${TAG}" ;;
+              eva-kernel)       merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/opensource/eva-kernel.git" "qcom/opensource/eva-kernel" "${TAG}" ;;
+              wlan-qcacld-3.0)  merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0.git" "qcom/opensource/wlan/qcacld-3.0" "${TAG}" ;;
+              wlan-cmn)         merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn.git" "qcom/opensource/wlan/qca-wifi-host-cmn" "${TAG}" ;;
+              wlan-fw-api)      merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api.git" "qcom/opensource/wlan/fw-api" "${TAG}" ;;
+              dataipa)          merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/opensource/dataipa.git" "qcom/opensource/dataipa" "${TAG}" ;;
+              securemsm-kernel) merge_one_clo "${TARGET}" "https://git.codelinaro.org/clo/la/platform/vendor/qcom/opensource/securemsm-kernel.git" "qcom/opensource/securemsm-kernel" "${TAG}" ;;
             esac
-
-            echo "Fetching tag ${TAG} from ${REPO} into ${PREFIX}..."
-            git fetch "${REPO}" "refs/tags/${TAG}"
-            if ! git merge --no-edit -X "subtree=${PREFIX}" FETCH_HEAD -m "Merge tag '${TAG}' into ${PREFIX}"; then
-              echo "=== MERGE CONFLICTS DETECTED (aborted safely) ==="
-              git diff --name-only --diff-filter=U
-              git merge --abort
-              exit 1
-            fi
+            [ -z "${CONFLICTS}" ] || exit 1
           fi
 
-          git log -n 3 --oneline
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "Dry-run enabled; skipping push."
-          else
+          echo "================================================================"
+          echo "=== SYNC SUMMARY ==="
+          printf "%b\n" "${RESULTS}"
+          echo "Merged count: ${MERGED}"
+          echo "Conflicts:${CONFLICTS:- none}"
+          echo "================================================================"
+          git log -n 12 --oneline
+
+          if [ "${MERGED}" -gt 0 ] && [ "${{ inputs.dry_run }}" != "true" ]; then
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
